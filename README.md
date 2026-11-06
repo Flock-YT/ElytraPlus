@@ -4,7 +4,7 @@
 
 Wear an elytra and use `/fly` to fly like in creative mode, without fireworks. Durability is consumed only while you are actually flying.
 
-## Installation
+## Bukkit installation
 
 1. Download `ElytraPlus-<version>.jar` from the [downloads page](https://github.com/Flock-YT/ElytraPlus/releases).
 2. Stop your server, put the file in its `plugins` folder, then start the server.
@@ -13,6 +13,19 @@ Wear an elytra and use `/fly` to fly like in creative mode, without fireworks. D
 Designed for Minecraft **1.9–26.3** on Bukkit, Spigot, Paper and Purpur. Folia is not supported. Automated compatibility checks have been run, but each version has not been tested on a live server; try it on a test server first.
 
 When upgrading, back up `plugins/ElytraPlus`, then stop the server and replace the old plugin file. Your existing settings are kept.
+
+## Fabric installation and permissions
+
+One universal `ElytraPlus-Fabric-<version>.jar` covers all **48 locked stable releases from 1.14 through 26.3**. Install Fabric Loader **0.19.5 or newer** and put the JAR in `mods`. Fabric API is not required by the core. Remote players do not need a client mod; local single-player and LAN integrated servers are supported.
+
+Use `/fly`, or `/elytraplus:fly` when another mod owns `/fly`. OP level 2+ and the integrated-server owner can use flight and bypass world restrictions by default. Durability bypass defaults to false. Ordinary LAN visitors do not automatically receive permissions.
+
+Optionally install the [Fabric Permissions API](https://github.com/lucko/fabric-permissions-api) and a compatible permission manager for your game version. The same three permission nodes below apply. Explicit allow/deny overrides defaults; undefined permissions retain the defaults above. Dependencies of the optional permission extension are supplied by those mods, not bundled in ElytraPlus.
+
+Fabric configuration lives in `config/elytraplus/config.yml`, with bilingual files under `config/elytraplus/lang/`. Settings and durability rules match Bukkit. World lists accept dimension IDs (`minecraft:overworld`, `minecraft:the_nether`, `minecraft:the_end`, or custom IDs such as `example:moon`) and the aliases `world`, `world_nether`, `world_the_end`. Fabric accepts the bStats switch for configuration compatibility but uploads no metrics.
+
+Acceptance is code-only: unit tests, compilation and offline native-hook/package verification. No real game scenarios or game startup tests are run or claimed. See [Fabric verification](fabric/README.md).
+
 
 ## How to fly
 
@@ -78,6 +91,27 @@ If you are upgrading from an older version, manually copy any custom `messages` 
 ### Disable usage statistics
 
 Find `bstats`, change the `enabled: true` beneath it to `enabled: false`, then save and restart.
+
+## Building and development
+
+Use the Gradle Wrapper; Maven is no longer needed. `shared/` is the platform-free Java 8 core; `bukkit/` contains Bukkit adapters; `fabric/` is an independent multi-version build. The root `gradle.properties` is the single version source.
+
+```sh
+# Run on JDK 25 with a JDK 21 toolchain installed; Python 3 is required
+./gradlew --no-daemon build
+# Bukkit only, JDK 21; production output remains Java 8
+./gradlew --no-daemon bukkitBuild
+# Fabric only, all locked versions, JDK 25
+./gradlew --no-daemon fabricBuild
+./gradlew clean
+# Check the same Bukkit JAR against all APIs using JDK 25
+./scripts/verify-api-compatibility.sh
+```
+
+Artifacts are `bukkit/build/libs/ElytraPlus-<version>.jar` and `fabric/build/libs/ElytraPlus-Fabric-<version>.jar`. Use `:bukkit:build` / `:fabric:build` and their `clean` tasks, or `bukkitClean` / `fabricClean`, for platform-specific work. IDE import exposes three sibling modules without configuring the game build. Cleaning removes all Fabric build outputs.
+
+Run one regression class with `./gradlew :bukkit:test --tests '*FlightManagerTest'`, or shared tests with `./gradlew :shared:test`. Gradle discovers toolchains; use `-Porg.gradle.java.installations.paths=<jdk21>,<jdk25>` when needed. CI publishes the exact verified JARs, SHA-256 sidecars and Fabric code report after both platforms pass. Version changes or manual dispatch trigger releases; this migration keeps version 2.0.2.
+
 
 ## Common questions
 

@@ -1,11 +1,11 @@
-name: Build and Release Bukkit Plugin
+name: Build and Release ElytraPlus
 
 on:
   push:
     branches:
       - main
     paths:
-      - pom.xml
+      - gradle.properties
   workflow_dispatch:
 
 permissions:
@@ -30,61 +30,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
-        with:
-          distribution: temurin
-          java-version: '21'
-          cache: maven
-
-      - name: Detect Maven version change
+      - name: Detect project version change
         id: version
         env:
           BEFORE_SHA: ${{ github.event.before }}
           EVENT_NAME: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-
-          read_version() {
-            mvn -q -Dstyle.color=never -f "$1" help:evaluate \
-              -Dexpression=project.version \
-              -DforceStdout 2>/dev/null | tr -d '\r'
-          }
-
-          current_version="$(read_version pom.xml)"
-          if [[ ! "$current_version" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
-            echo "Invalid Maven project.version: $current_version" >&2
-            exit 1
-          fi
-
-          should_release=false
-          previous_version='<manual>'
-
-          if [[ "$EVENT_NAME" == 'workflow_dispatch' ]]; then
-            if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
-              echo "Manual releases must run from the main branch." >&2
-              exit 1
-            fi
-            should_release=true
-          elif [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
-            previous_version='<none>'
-            should_release=true
-          else
-            git show "${BEFORE_SHA}:pom.xml" > "$RUNNER_TEMP/pom-before.xml"
-            previous_version="$(read_version "$RUNNER_TEMP/pom-before.xml")"
-            if [[ "$previous_version" != "$current_version" ]]; then
-              should_release=true
-            fi
-          fi
-
-          echo "Previous version: $previous_version"
-          echo "Current version: $current_version"
-          echo "Release required: $should_release"
-
-          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
-          echo "version=$current_version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$current_version" >> "$GITHUB_OUTPUT"
-          echo "artifact=ElytraPlus-$current_version.jar" >> "$GITHUB_OUTPUT"
+        run: python3 scripts/detect-release.py
 
   build:
     needs: detect-version
@@ -102,17 +53,24 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-          cache: maven
+          cache: gradle
+          cache-dependency-path: |
+            *.gradle
+            bukkit/*.gradle
+            shared/*.gradle
+            gradle.properties
+            gradle/*.gradle
+            gradle/wrapper/gradle-wrapper.properties
 
-      - name: Build with Maven
-        run: mvn -B --no-transfer-progress clean verify
+      - name: Build Bukkit with Gradle
+        run: ./gradlew --no-daemon bukkitClean bukkitBuild
 
       - name: Verify release JAR
-        run: ./scripts/verify-release-jar.sh "target/${{ needs.detect-version.outputs.artifact }}" "${{ needs.detect-version.outputs.version }}"
+        run: ./scripts/verify-release-jar.sh "bukkit/build/libs/${{ needs.detect-version.outputs.artifact }}" "${{ needs.detect-version.outputs.version }}"
 
       - name: Record verified JAR digest
         id: digest
-        working-directory: target
+        working-directory: bukkit/build/libs
         env:
           ARTIFACT: ${{ needs.detect-version.outputs.artifact }}
         run: |
@@ -127,8 +85,8 @@ jobs:
         with:
           name: release-jar
           path: |
-            target/${{ needs.detect-version.outputs.artifact }}
-            target/${{ needs.detect-version.outputs.artifact }}.sha256
+            bukkit/build/libs/${{ needs.detect-version.outputs.artifact }}
+            bukkit/build/libs/${{ needs.detect-version.outputs.artifact }}.sha256
           if-no-files-found: error
 
   compatibility:
@@ -138,11 +96,17 @@ jobs:
     with:
       artifact-name: release-jar
 
+  fabric:
+    needs: detect-version
+    if: needs.detect-version.outputs.should_release == 'true'
+    uses: ./.github/workflows/fabric-compatibility.yml
+
   release:
     needs:
       - detect-version
       - build
       - compatibility
+      - fabric
     if: needs.detect-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -160,6 +124,12 @@ jobs:
           name: release-jar
           path: dist
 
+      - name: Download verified Fabric release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-fabric
+          path: dist
+
       - name: Fail if tag already exists
         env:
           TAG: ${{ needs.detect-version.outputs.tag }}
@@ -175,4 +145,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect-version.outputs.version }}
           EXPECTED_SHA256: ${{ needs.build.outputs.sha256 }}
-        run: bash scripts/create-release.sh "$VERSION" dist "$EXPECTED_SHA256"
+          EXPECTED_FABRIC_SHA256: ${{ needs.fabric.outputs.sha256 }}
+        run: |
+          bash scripts/create-release.sh "$VERSION" dist "$EXPECTED_SHA256" "$EXPECTED_FABRIC_SHA256"

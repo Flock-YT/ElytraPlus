@@ -114,3 +114,9 @@ run/
 
 # Local contributor guide
 /AGENTS.md
+
+# Gradle
+.gradle/
+**/build/
+__pycache__/
+!gradle/wrapper/gradle-wrapper.jar

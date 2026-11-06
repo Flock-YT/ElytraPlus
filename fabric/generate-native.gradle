@@ -1,0 +1,396 @@
+import groovy.json.JsonOutput
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.Opcodes
+import org.objectweb.asm.Type
+import org.objectweb.asm.tree.ClassNode
+import org.objectweb.asm.tree.MethodInsnNode
+import java.util.zip.ZipFile
+
+buildscript {
+    repositories { maven { url = 'https://maven.fabricmc.net/' }; mavenCentral() }
+    dependencies { classpath 'org.ow2.asm:asm-tree:9.10.1' }
+}
+
+/** Compile ordinary, required Mixins against each pinned game's actual API. */
+class ElytraPlusNativeSources {
+    final Map spec
+    final File output
+    final Map<String, ClassNode> classes = [:]
+    final List<String> mixins = []
+    final boolean official
+    final String world
+    final String serverWorld
+    final String entity
+    final String position
+    final String state
+    final String source
+    final String commands
+    final String player
+    final String registry
+
+    ElytraPlusNativeSources(Map spec, File output, List<File> jars) {
+        this.spec = spec
+        this.output = output
+        official = spec.namespace == 'official'
+        jars.each { file ->
+            new ZipFile(file).withCloseable { jar ->
+                jar.entries().each { entry ->
+                    if (entry.name.endsWith('.class') && entry.name.startsWith('net/minecraft/')) {
+                        ClassNode node = new ClassNode()
+                        int flags = ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES
+                        if (!['LivingEntity', 'World', 'ServerWorld', 'Level', 'ServerLevel'].any {
+                            entry.name.endsWith('/' + it + '.class')
+                        }) { flags |= ClassReader.SKIP_CODE }
+                        new ClassReader(jar.getInputStream(entry)).accept(node, flags)
+                        classes[node.name.replace('/', '.')] = node
+                    }
+                }
+            }
+        }
+        world = requireClass(official ? 'net.minecraft.world.level.Level' : 'net.minecraft.world.World')
+        serverWorld = requireClass(official ? 'net.minecraft.server.level.ServerLevel' : 'net.minecraft.server.world.ServerWorld')
+        entity = requireClass(official ? 'net.minecraft.world.entity.Entity' : 'net.minecraft.entity.Entity')
+        position = state = registry = ''
+        source = requireClass(official ? 'net.minecraft.commands.CommandSourceStack' : 'net.minecraft.server.command.ServerCommandSource')
+        commands = requireClass(official ? 'net.minecraft.commands.Commands' : 'net.minecraft.server.command.CommandManager')
+        player = requireClass(official ? 'net.minecraft.server.level.ServerPlayer' : 'net.minecraft.server.network.ServerPlayerEntity')
+
+    }
+
+    String requireClass(String name) {
+        if (!classes.containsKey(name)) { throw new GradleException("${spec.minecraft}: missing required native class ${name}") }
+        return name
+    }
+
+    def method(String owner, List<String> names, Closure filter = { true }) {
+        def result = classes[owner]?.methods?.find { names.contains(it.name) && filter(it) }
+        if (result == null) { throw new GradleException("${spec.minecraft}: required native hook missing: ${owner} ${names}") }
+        return result
+    }
+
+    boolean has(String owner, String name) {
+        ClassNode type = classes[owner]
+        while (type != null) {
+            if (type.methods.any { it.name == name }) { return true }
+            type = classes[type.superName?.replace('/', '.')]
+        }
+        return false
+    }
+
+    def explosionConstructor(String owner, def work, String explosion, Set<String> visited = [] as Set) {
+        if (!visited.add(owner + '.' + work.name + work.desc)) { return null }
+        def direct = work.instructions.find { it instanceof MethodInsnNode && it.name == '<init>' && it.owner.replace('/', '.') == explosion }
+        if (direct != null) { return direct }
+        for (def call : work.instructions.findAll { it instanceof MethodInsnNode && ['createExplosion', 'explode'].contains(it.name) }) {
+            ClassNode type = classes[call.owner.replace('/', '.')]
+            while (type != null) {
+                def next = type.methods.find { it.name == call.name && it.desc == call.desc }
+                if (next != null) {
+                    def found = explosionConstructor(type.name.replace('/', '.'), next, explosion, visited)
+                    if (found != null) { return found }
+                    break
+                }
+                type = classes[type.superName?.replace('/', '.')]
+            }
+        }
+        return null
+    }
+
+    static String javaType(Type type) { type.className.replace('$', '.') }
+    static String selector(def method) { method.name + method.desc }
+    static String arguments(def method) {
+        Type.getArgumentTypes(method.desc).toList().withIndex().collect { type, index -> javaType(type) + ' arg' + index }.join(', ')
+    }
+    static String values(def method) { Type.getArgumentTypes(method.desc).indices.collect { 'arg' + it }.join(', ') }
+    static String boxed(Type type) {
+        return [void: 'Void', boolean: 'Boolean', int: 'Integer', long: 'Long', float: 'Float', double: 'Double'][type.className] ?: javaType(type)
+    }
+    String argument(def method, String type) {
+        int index = Type.getArgumentTypes(method.desc).findIndexOf { it.className == type }
+        if (index < 0) { throw new GradleException("${spec.minecraft}: ${method.name} has no ${type} parameter") }
+        return 'arg' + index
+    }
+    String worldArgument(def method) {
+        def index = Type.getArgumentTypes(method.desc).findIndexOf { [world, serverWorld].contains(it.className) }
+        if (index < 0) { throw new GradleException("${spec.minecraft}: ${method.name} has no world parameter") }
+        return 'arg' + index
+    }
+
+    void write(String name, String contents) {
+        File file = new File(output, name.replace('.', '/') + '.java')
+        file.parentFile.mkdirs()
+        file.setText(contents, 'UTF-8')
+    }
+
+    void mixin(String name, String target, String body, String interfaces = '') {
+        mixins.add(name)
+        write('cn.ericcraft.elytraPlus.fabric.runtime.mixin.' + name, """package cn.ericcraft.elytraPlus.fabric.runtime.mixin;
+import java.util.*;
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import cn.ericcraft.elytraPlus.fabric.*;
+import cn.ericcraft.elytraPlus.fabric.runtime.RuntimeInitializer;
+import cn.ericcraft.elytraPlus.core.*;
+import org.spongepowered.asm.mixin.*;
+import org.spongepowered.asm.mixin.injection.*;
+import org.spongepowered.asm.mixin.injection.callback.*;
+${target.contains('$') || (classes[target].access & Opcodes.ACC_PUBLIC) == 0 ? '@Mixin(targets="' + target + '")' : '@Mixin(' + target + '.class)'}
+public abstract class ${name} ${interfaces} {
+${body}
+}
+""")
+    }
+
+    def inherited(String owner, List<String> names, Closure filter = { true }) {
+        List<String> pending = [owner]
+        Set<String> seen = [] as Set
+        while (!pending.empty) {
+            String current = pending.remove(0)
+            if (!seen.add(current)) continue
+            ClassNode type = classes[current]
+            if (type == null) continue
+            def found = type.methods.find { names.contains(it.name) && filter(it) }
+            if (found != null) return found
+            if (type.superName != null) pending.add(type.superName.replace('/', '.'))
+            pending.addAll(type.interfaces.collect { it.replace('/', '.') })
+        }
+        throw new GradleException("${spec.minecraft}: missing inherited native method ${owner} ${names}")
+    }
+    String call(String owner, List<String> names, Closure filter = { true }) { inherited(owner, names, filter).name }
+    String callback(def method) { Type.getReturnType(method.desc).sort == Type.VOID ? 'CallbackInfo' : 'CallbackInfoReturnable<' + boxed(Type.getReturnType(method.desc)) + '>' }
+    String noArgs(String owner, List<String> names) { call(owner, names) { Type.getArgumentTypes(it.desc).length == 0 } }
+
+    void access() {
+        String server = 'net.minecraft.server.MinecraftServer'
+        String basePlayer = official ? 'net.minecraft.world.entity.player.Player' : 'net.minecraft.entity.player.PlayerEntity'
+        String stack = requireClass(official ? 'net.minecraft.world.item.ItemStack' : 'net.minecraft.item.ItemStack')
+        String equipment = requireClass(official ? 'net.minecraft.world.entity.EquipmentSlot' : 'net.minecraft.entity.EquipmentSlot')
+        String items = requireClass(official ? 'net.minecraft.world.item.Items' : 'net.minecraft.item.Items')
+        String chest = 'p.' + call(player, ['getItemBySlot', 'getEquippedStack']) + '(' + equipment + '.CHEST)'
+        String ability = has(basePlayer, 'getAbilities') ? 'p.getAbilities()' : 'p.abilities'
+        String sync = noArgs(player, ['sendAbilitiesUpdate', 'onUpdateAbilities'])
+        String allow = official ? 'mayfly' : 'allowFlying'
+        String uuid = noArgs(player, ['getUuid', 'getUUID'])
+        String playerSource = noArgs(player, ['getCommandSource', 'createCommandSourceStack'])
+        String serverGetter = noArgs(source, ['getServer', 'getMinecraftServer'])
+        String permitted = has(source, 'hasPermissionLevel') ? 'src.hasPermissionLevel(2)' :
+                (official ? "${commands}.LEVEL_GAMEMASTERS.check(src.permissions())" : "${commands}.GAMEMASTERS_CHECK.allows(src.getPermissions())")
+        def ownerMethod = classes[server].methods.find { ['isOwner', 'isHost'].contains(it.name) && it.desc == '(Lcom/mojang/authlib/GameProfile;)Z' }
+        String profile = 'p.getGameProfile()'
+        String own = ownerMethod != null ? "src.${serverGetter}().${ownerMethod.name}(${profile})" :
+                "src.${serverGetter}().${method(server, ['getHostProfile', 'getSingleplayerProfile']).name}() != null && src.${serverGetter}().${method(server, ['getHostProfile', 'getSingleplayerProfile']).name}().equals(${profile})"
+        String worldExpression = '((' + world + ') ((NativeEntityAccess) p).elytraplus$getWorld())'
+        String registry = classes.containsKey('net.minecraft.registry.Registries') ? 'net.minecraft.registry.Registries' : 'net.minecraft.util.registry.Registry'
+        String dimensionRegistry = classes[registry]?.fields?.find { ['DIMENSION', 'DIMENSION_TYPE'].contains(it.name) }?.name
+        String dimension = official ? "${worldExpression}.dimension().${has('net.minecraft.resources.ResourceKey', 'identifier') ? 'identifier' : 'location'}().toString()" :
+                (has(world, 'getRegistryKey') ? "${worldExpression}.getRegistryKey().getValue().toString()" :
+                        "${registry}.${dimensionRegistry}.getId(${worldExpression}.getDimension().getType()).toString()")
+        String damage = noArgs(stack, ['getDamage', 'getDamageValue'])
+        String maximum = noArgs(stack, ['getMaxDamage', 'getDurability'])
+        String setDamage = call(stack, ['setDamage', 'setDamageValue'])
+        String unbreakable
+        String components = official ? 'net.minecraft.core.component.DataComponents' : 'net.minecraft.component.DataComponentTypes'
+        if (classes.containsKey(components)) {
+            unbreakable = "chest().${call(stack, ['contains', 'has']) { Type.getArgumentTypes(it.desc).length == 1 }}(${components}.UNBREAKABLE)"
+        } else {
+            String tag = noArgs(stack, ['getNbt', 'getTag'])
+            unbreakable = "chest().${tag}() != null && chest().${tag}().getBoolean(\"Unbreakable\")"
+        }
+        String unbreaking
+        String enchantments = official ? 'net.minecraft.world.item.enchantment.Enchantments' : 'net.minecraft.enchantment.Enchantments'
+        if (has(stack, 'getEnchantments') && classes.containsKey(components) &&
+                Type.getReturnType(inherited(stack, ['getEnchantments']).desc).className != 'net.minecraft.nbt.NbtList') {
+            String collection = official ? 'keySet' : 'getEnchantments'
+            String holder = official ? 'net.minecraft.core.Holder<net.minecraft.world.item.enchantment.Enchantment>' : 'net.minecraft.registry.entry.RegistryEntry<net.minecraft.enchantment.Enchantment>'
+            String key = official ? "e.unwrapKey().get().${has('net.minecraft.resources.ResourceKey', 'identifier') ? 'identifier' : 'location'}()" : 'e.getKey().get().getValue()'
+            String optional = official ? 'e.unwrapKey()' : 'e.getKey()'
+            String enchantmentComponent = Type.getReturnType(inherited(stack, ['getEnchantments']).desc).className
+            String levelArgument = Type.getArgumentTypes(inherited(enchantmentComponent, ['getLevel']).desc)[0].className.endsWith('.Enchantment') ? 'e.value()' : 'e'
+            unbreaking = "for (${holder} e : chest().getEnchantments().${collection}()) { if (${optional}.isPresent() && \"minecraft:unbreaking\".equals(${key}.toString())) return Math.max(0, chest().getEnchantments().getLevel(${levelArgument})); } return 0;"
+        } else {
+            String helper = official ? 'net.minecraft.world.item.enchantment.EnchantmentHelper' : 'net.minecraft.enchantment.EnchantmentHelper'
+            String level = call(helper, ['getLevel', 'getItemEnchantmentLevel']) { Type.getArgumentTypes(it.desc).length == 2 }
+            unbreaking = "return Math.max(0, ${helper}.${level}(${enchantments}.UNBREAKING, chest()));"
+        }
+        String sounds = official ? 'net.minecraft.sounds.SoundEvents' : 'net.minecraft.sound.SoundEvents'
+        def sound = classes[sounds].fields.find { ['ENTITY_ITEM_BREAK', 'ITEM_BREAK'].contains(it.name) }
+        if (sound == null) throw new GradleException('Missing item break sound')
+        String soundValue = sounds + '.' + sound.name
+        if (sound.desc.contains('RegistryEntry') || sound.desc.contains('Holder')) soundValue += '.value()'
+        def sendMethod = inherited(player, ['sendSystemMessage', 'sendMessage']) { Type.getArgumentTypes(it.desc).length == 1 || (Type.getArgumentTypes(it.desc).length == 2 && Type.getArgumentTypes(it.desc)[1].sort == Type.BOOLEAN) }
+        String send = sendMethod.name
+        String sendExtra = Type.getArgumentTypes(sendMethod.desc).length == 2 ? ', false' : ''
+        String nativeMode = 'p.isCreative() || p.isSpectator()'
+        String manager = noArgs(server, ['getPlayerManager', 'getPlayerList'])
+        String managerType = Type.getReturnType(inherited(server, [manager]).desc).className
+        String find = call(managerType, ['getPlayer']) { it.desc.startsWith('(Ljava/util/UUID;)') }
+        String text = official ? 'net.minecraft.network.chat.Component' : (classes.containsKey('net.minecraft.text.Text') ? 'net.minecraft.text.Text' : 'net.minecraft.network.chat.Component')
+        String literal = official ? "${text}.literal(value)" : (classes.containsKey('net.minecraft.text.LiteralText') ? 'new net.minecraft.text.LiteralText(value)' :
+                (classes.containsKey('net.minecraft.text.Text') ? "${text}.literal(value)" : 'new net.minecraft.network.chat.TextComponent(value)'))
+        String mutable = has(text, 'literal') ? Type.getReturnType(inherited(text, ['literal'], { Type.getArgumentTypes(it.desc).length == 1 }).desc).className : (classes.containsKey('net.minecraft.text.LiteralText') ? 'net.minecraft.text.LiteralText' : text)
+        // Legacy text classes have constructors instead of a literal factory.
+        String format = official ? 'net.minecraft.ChatFormatting' : (classes.containsKey('net.minecraft.util.Formatting') ? 'net.minecraft.util.Formatting' : 'net.minecraft.ChatFormat')
+        String formatted = call(mutable, ['formatted', 'withStyle', 'applyFormat']) { Type.getArgumentTypes(it.desc).length == 1 && Type.getArgumentTypes(it.desc)[0].className == format }
+        String feedback
+        if (official) feedback = 'src.sendSuccess(() -> NativeFlightPlayer.text(message), false);'
+        else {
+            def method = inherited(source, ['sendFeedback'])
+            feedback = "src.sendFeedback(${method.desc.contains('Ljava/util/function/Supplier;') ? '() -> ' : ''}NativeFlightPlayer.text(message), false);"
+        }
+        write('cn.ericcraft.elytraPlus.fabric.runtime.NativeFlightPlayer', """package cn.ericcraft.elytraPlus.fabric.runtime;
+import java.util.*;
+import cn.ericcraft.elytraPlus.core.*;
+import cn.ericcraft.elytraPlus.fabric.*;
+public final class NativeFlightPlayer implements FlightPlayer {
+ private final ${player} p;
+ public NativeFlightPlayer(${player} p) { this.p = p; }
+ private ${stack} chest() { return ${chest}; }
+ public UUID id() { return p.${uuid}(); }
+ public boolean online() { return server().${manager}().${find}(id()) == p; }
+ public boolean dead() { return !p.isAlive(); }
+ public boolean nativeFlight() { return ${nativeMode}; }
+ public boolean allowFlight() { return ${ability}.${allow}; }
+ public boolean flying() { return ${ability}.flying; }
+ public void allowFlight(boolean value) { ${ability}.${allow} = value; p.${sync}(); }
+ public void flying(boolean value) { ${ability}.flying = value; p.${sync}(); }
+ public ${server} server() { return ${worldExpression}.getServer(); }
+ public String world() { return ${dimension}; }
+ public boolean permission(String node) {
+  ${source} src = p.${playerSource}();
+  boolean fallback = !node.equals("elytraplus.bypass.durability") && (${permitted} || (${own}));
+  return FabricServices.permission(src, node, fallback);
+ }
+ public boolean wearingElytra() { return chest().getItem() == ${items}.ELYTRA; }
+ public boolean usableElytra() { return wearingElytra() && chest().${damage}() < chest().${maximum}() - 1; }
+ public boolean unbreakable() { return ${unbreakable}; }
+ public int unbreaking() { ${unbreaking} }
+ public void damageOne() { chest().${setDamage}(Math.min(chest().${damage}() + 1, chest().${maximum}() - 1)); }
+ public void breakSound() { p.playSound(${soundValue}, 1.0f, 1.0f); }
+ public void message(String message) { if (!message.isEmpty()) p.${send}(text(message)${sendExtra}); }
+ public static ${text} text(String message) {
+  String value = "";
+  ${mutable} result = ${literal};
+  String[] names = {"BLACK","DARK_BLUE","DARK_GREEN","DARK_AQUA","DARK_RED","DARK_PURPLE","GOLD","GRAY","DARK_GRAY","BLUE","GREEN","AQUA","RED","LIGHT_PURPLE","YELLOW","WHITE","OBFUSCATED","BOLD","STRIKETHROUGH","UNDERLINE","ITALIC","RESET"};
+  for (LegacyText.Run run : LegacyText.parse(message)) {
+   value = run.text;
+   ${mutable} part = ${literal};
+   for (char code : run.formats.toCharArray()) part.${formatted}(${format}.valueOf(names["0123456789abcdefklmnor".indexOf(code)]));
+   result.append(part);
+  }
+  return result;
+ }
+}
+""")
+        write('cn.ericcraft.elytraPlus.fabric.runtime.NativeAccessImpl', """package cn.ericcraft.elytraPlus.fabric.runtime;
+import java.util.UUID;
+import cn.ericcraft.elytraPlus.core.FlightPlayer;
+import cn.ericcraft.elytraPlus.fabric.*;
+public final class NativeAccessImpl implements NativeAccess {
+ public FlightPlayer wrap(Object input) { return new NativeFlightPlayer((${player}) input); }
+ public Object playerServer(Object input) { return new NativeFlightPlayer((${player}) input).server(); }
+ public Object commandServer(Object input) { return ((${source}) input).${serverGetter}(); }
+ public Object commandPlayer(Object input) { Object entity = ((${source}) input).getEntity(); return entity instanceof ${player} ? entity : null; }
+ public FlightPlayer find(Object server, UUID id) { ${player} p = ((${server}) server).${manager}().${find}(id); return p == null ? null : new NativeFlightPlayer(p); }
+ public void reply(Object input, String message) { if (message.isEmpty()) return; ${source} src = (${source}) input; ${feedback} }
+}
+""")
+        def entityWorld = classes[entity].fields.find { it.desc == 'L' + world.replace('.', '/') + ';' }
+        if (entityWorld == null) throw new GradleException('Missing entity world field')
+        mixin('EntityMixin', entity, '@Shadow private ' + world + ' ' + entityWorld.name + ';\npublic Object elytraplus$getWorld() { return ' + entityWorld.name + '; }', 'implements NativeEntityAccess')
+    }
+    void lifecycle() {
+        String server = 'net.minecraft.server.MinecraftServer'
+        def run = method(server, ['runServer', 'run', 'method_29741'])
+        def stop = method(server, ['shutdown', 'stopServer'])
+        def tick = method(server, ['tick', 'tickServer'])
+        mixin('MinecraftServerMixin', server, """
+ @Inject(method="${selector(run)}", at=@At("HEAD"))
+ private void elytraplus_start(CallbackInfo ci) { FabricServices.start(this); }
+ @Inject(method="${selector(stop)}", at=@At("HEAD"))
+ private void elytraplus_stop(CallbackInfo ci) { FabricServices.stop(this); }
+ @Inject(method="${selector(tick)}", at=@At("TAIL"))
+ private void elytraplus_tick(CallbackInfo ci) { FabricServices.tick(this); }
+""")
+        def dispatcher = classes[commands].fields.find { it.desc == 'Lcom/mojang/brigadier/CommandDispatcher;' }
+        if (dispatcher == null) throw new GradleException('Missing command dispatcher')
+        mixin('CommandManagerMixin', commands, """
+ @Shadow @Final private CommandDispatcher<${source}> ${dispatcher.name};
+ @Inject(method="<init>", at=@At("RETURN"))
+ private void elytraplus_commands(CallbackInfo ci) {
+  for (String name : new String[]{"fly", "elytraplus:fly"}) {
+   ${dispatcher.name}.register(LiteralArgumentBuilder.<${source}>literal(name)
+    .executes(ctx -> FabricServices.command(ctx.getSource(), false))
+    .then(com.mojang.brigadier.builder.RequiredArgumentBuilder.<${source}, String>argument("args", com.mojang.brigadier.arguments.StringArgumentType.greedyString())
+     .executes(ctx -> FabricServices.command(ctx.getSource(), true))));
+  }
+ }
+""")
+        def death = method(player, ['onDeath', 'die'])
+        def playerTick = method(player, ['tick'])
+        def mode = method(player, ['setGameMode', 'changeGameMode'])
+        mixin('ServerPlayerMixin', player, """
+ @Inject(method="${selector(playerTick)}", at=@At("TAIL"))
+ private void elytraplus_playerTick(CallbackInfo ci) { FabricServices.playerTick(this); }
+ @Inject(method="${selector(death)}", at=@At("HEAD"))
+ private void elytraplus_death(CallbackInfo ci) { FabricServices.death(this); }
+ @Inject(method="${selector(mode)}", at=@At("RETURN"))
+ private void elytraplus_mode(${callback(mode)} ci) { FabricServices.playerTick(this); }
+""")
+        String manager = official ? 'net.minecraft.server.players.PlayerList' : 'net.minecraft.server.PlayerManager'
+        def remove = method(manager, ['remove']) { it.desc.startsWith('(L' + player.replace('.', '/') + ';)') }
+        def respawn = method(manager, ['respawnPlayer', 'respawn']) { Type.getReturnType(it.desc).className == player }
+        mixin('PlayerManagerMixin', manager, """
+ @Inject(method="${selector(remove)}", at=@At("HEAD"))
+ private void elytraplus_quit(${player} actor, CallbackInfo ci) { FabricServices.quit(actor); }
+ @Inject(method="${selector(respawn)}", at=@At("RETURN"))
+ private void elytraplus_respawn(CallbackInfoReturnable<${player}> ci) { FabricServices.respawn(ci.getReturnValue()); }
+""")
+        String handler = official ? 'net.minecraft.server.network.ServerGamePacketListenerImpl' : 'net.minecraft.server.network.ServerPlayNetworkHandler'
+        def abilities = method(handler, ['onPlayerAbilities', 'onUpdatePlayerAbilities', 'handlePlayerAbilities'])
+        def actor = classes[handler].fields.find { it.desc == 'L' + player.replace('.', '/') + ';' }
+        if (actor == null) throw new GradleException('Missing network player field')
+        // Inject after the packet handler's thread dispatch, before its first ability mutation.
+        // TAIL validation also runs on the dispatched invocation; no game state is touched on the network thread.
+        mixin('FlightRequestMixin', handler, """
+ @Shadow public ${player} ${actor.name};
+ @Inject(method="${selector(abilities)}", at=@At("TAIL"))
+ private void elytraplus_flightRequest(CallbackInfo ci) { FabricServices.flightRequest(${actor.name}); }
+""")
+    }
+    void generate() {
+        output.mkdirs()
+        access()
+        lifecycle()
+        new File(output, 'mixins.json').setText(JsonOutput.toJson(mixins), 'UTF-8')
+    }
+}
+
+def nativeSources = layout.buildDirectory.dir('generated/native-sources')
+tasks.register('generateNativeSources') {
+    inputs.property('target', project.targetSpec)
+    inputs.file(rootProject.file('generate-native.gradle'))
+    outputs.dir(nativeSources)
+    doLast {
+        File directory = nativeSources.get().asFile
+        project.delete(directory)
+        if (project.targetSpec.namespace == 'intermediary') {
+            File artifact = project.configurations.getByName('mappings').singleFile
+            String digest = java.security.MessageDigest.getInstance('SHA-256').digest(artifact.bytes).encodeHex().toString()
+            if (digest != project.targetSpec.mappingsSha256) {
+                throw new GradleException("${project.targetSpec.minecraft}: pinned Yarn digest mismatch")
+            }
+        }
+        def extension = project.extensions.getByName('loom')
+        def namespaces = extension.class.classLoader.loadClass('net.fabricmc.loom.api.mappings.layered.MappingsNamespace')
+        def named = namespaces.enumConstants.find { it.name() == 'NAMED' }
+        def jars = extension.getMinecraftJars(named).collect { it.toFile() }
+        new ElytraPlusNativeSources(project.targetSpec, directory, jars).generate()
+    }
+}
+sourceSets.main.java.srcDir(nativeSources)
+tasks.named('compileJava') { dependsOn('generateNativeSources') }
+tasks.named('runtimeMetadata') {
+    dependsOn('generateNativeSources')
+    inputs.file(nativeSources.map { directory -> directory.file('mixins.json') })
+}
+project.ext.nativeSourcesDirectory = nativeSources

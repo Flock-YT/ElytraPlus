@@ -1,10 +1,10 @@
 [English](README.md) | **中文**
 
-# ElytraPlus 鞘翅飞行插件
+# ElytraPlus 鞘翅飞行插件／模组
 
-穿上鞘翅，输入 `/fly`，就能像创造模式一样自由飞行，无需烟花。只有实际飞行时才会消耗耐久。
+提供 Bukkit 插件和独立 Fabric 模组，共享飞行规则。穿上鞘翅，输入 `/fly`，就能像创造模式一样自由飞行，无需烟花。只有实际飞行时才会消耗耐久。
 
-## 安装
+## Bukkit 安装
 
 1. 从 [下载页面](https://github.com/Flock-YT/ElytraPlus/releases) 下载 `ElytraPlus-版本号.jar`。
 2. 关闭服务端，将文件放入服务端的 `plugins` 文件夹，再启动服务端。
@@ -13,6 +13,18 @@
 适用于 Minecraft **1.9 至 26.3** 的 Bukkit、Spigot、Paper、Purpur 服务端，不支持 Folia。已进行自动兼容检查，尚未逐版本实服测试；建议先在测试服试用。
 
 升级时先备份 `plugins/ElytraPlus` 文件夹，再停服替换旧插件文件。已有配置会保留。
+
+## Fabric 安装与权限
+
+Fabric 使用一个通用 `ElytraPlus-Fabric-<版本>.jar`，覆盖 **1.14～26.3 的全部 48 个锁定正式版**。安装 Fabric Loader **0.19.5 或更高版本**，将 JAR 放入 `mods`。核心无需 Fabric API；玩家连接远程服务器无需安装客户端模组。也支持本地单人和局域网集成服务器。
+
+使用 `/fly` 开关飞行；命令冲突时使用 `/elytraplus:fly`。默认 OP 等级 2 及以上和单人房主可以使用并绕过世界限制，默认仍消耗耐久。普通局域网访客不自动获得权限。
+
+可选安装适用于当前游戏版本的 [Fabric Permissions API](https://github.com/lucko/fabric-permissions-api) 和权限管理模组，使用下表相同的三个权限节点授权普通玩家。显式允许／拒绝优先；未配置时使用上述默认规则。权限扩展的依赖由对应模组提供，不包含在 ElytraPlus 内。
+
+Fabric 配置位于 `config/elytraplus/config.yml`，双语文件位于其 `lang/` 目录。配置键、语言与耐久行为和 Bukkit 相同。世界列表使用 `minecraft:overworld`、`minecraft:the_nether`、`minecraft:the_end` 或自定义维度 ID（例如 `example:moon`），也兼容 `world`、`world_nether`、`world_the_end` 别名。Fabric 不上传 bStats 统计，保留开关只为兼容配置。
+
+本次仅做代码测试、编译和离线钩子／打包校验；不运行真实游戏场景，不代表全版本游戏实测。详见 [Fabric 验证说明](fabric/README.md)。
 
 ## 怎么飞
 
@@ -25,7 +37,7 @@
 
 ## 让普通玩家也能用
 
-默认只有 OP 可以使用。请在你使用的权限插件中，给玩家或玩家组添加 `elytraplus.use` 权限；想让所有普通玩家都能用，就添加到默认玩家组。
+Bukkit 默认只有 OP 可以使用。请在你使用的权限插件中，给玩家或玩家组添加 `elytraplus.use` 权限；想让所有普通玩家都能用，就添加到默认玩家组。
 
 | 权限名称 | 作用 | 默认谁有 |
 | --- | --- | --- |
@@ -37,7 +49,7 @@
 
 ## 修改设置
 
-配置文件在 `plugins/ElytraPlus/config.yml`，首次启动后自动生成。默认配置就能使用，按需修改即可。
+Bukkit 配置文件在 `plugins/ElytraPlus/config.yml`，首次启动后自动生成。默认配置就能使用，按需修改即可。
 
 - `true` 表示开启，`false` 表示关闭。
 - 只改需要的值，保留每行开头的空格，不要用 Tab 缩进。
@@ -78,6 +90,29 @@
 ### 关闭使用统计
 
 找到 `bstats`，把它下面的 `enabled: true` 改成 `enabled: false`，保存后重启即可。
+
+## 构建与开发
+
+项目使用 Gradle Wrapper，无需 Maven。`shared/` 是无平台依赖的 Java 8 核心；`bukkit/` 包含 Bukkit 入口和适配；`fabric/` 是独立的多版本构建。根 `gradle.properties` 是唯一版本来源。
+
+```sh
+# JDK 25 运行，安装 JDK 21 工具链；需要 Python 3
+./gradlew --no-daemon build
+# 单独构建 Bukkit：JDK 21 即可，输出 Java 8 字节码
+./gradlew --no-daemon bukkitBuild
+# 单独构建并验证全部 Fabric 版本：JDK 25
+./gradlew --no-daemon fabricBuild
+# 两端清理；也可使用 bukkitClean / fabricClean
+./gradlew clean
+# Bukkit 同一 JAR 的全 API 代码检查：使用 JDK 25
+./scripts/verify-api-compatibility.sh
+```
+
+产物为 `bukkit/build/libs/ElytraPlus-<版本>.jar` 和 `fabric/build/libs/ElytraPlus-Fabric-<版本>.jar`。可使用 `:bukkit:build`／`:fabric:build` 及各自的 `clean` 任务；单平台构建无需配置另一平台的游戏模块。IDE 展示 `shared`、`bukkit`、`fabric` 三个同级节点。
+
+单类测试使用 `./gradlew :bukkit:test --tests '*FlightManagerTest'`，共享核心测试使用 `./gradlew :shared:test`。Gradle 自动发现工具链；必要时通过 `-Porg.gradle.java.installations.paths=<jdk21>,<jdk25>` 指定。清理会删除整个 Fabric 构建目录。
+
+CI 校验两端后发布同一批已验证的 JAR、SHA-256 和 Fabric 代码报告。仅版本变化或手动触发才发布；此次迁移保持版本 2.0.2。
 
 ## 常见问题
 

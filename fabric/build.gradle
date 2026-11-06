@@ -1,0 +1,110 @@
+import groovy.json.JsonOutput
+
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '9.2.2'
+    id 'net.fabricmc.fabric-loom-remap' version '1.17.21' apply false
+    id 'net.fabricmc.fabric-loom' version '1.17.21' apply false
+}
+
+apply from: file('../gradle/project-version.gradle')
+group = 'cn.ericcraft.elytraPlus'
+def lock = gradle.ext.fabricLock
+def targets = gradle.ext.fabricTargets
+
+allprojects {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        mavenCentral()
+    }
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+    }
+}
+
+java { toolchain { languageVersion = JavaLanguageVersion.of(25) } }
+tasks.withType(JavaCompile).configureEach { options.release = 8 }
+dependencies {
+    implementation project(':shared')
+    compileOnly "net.fabricmc:fabric-loader:${lock.loader}"
+    implementation 'org.yaml:snakeyaml:2.5'
+    testImplementation "net.fabricmc:fabric-loader:${lock.loader}"
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testImplementation 'org.mockito:mockito-core:5.23.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
+}
+sourceSets.main.java.setSrcDirs(['bootstrap/src/main/java'])
+sourceSets.main.resources.srcDir('../bukkit/src/main/resources')
+tasks.named('processResources') { exclude 'plugin.yml' }
+sourceSets.test.java.setSrcDirs(['bootstrap/src/test/java'])
+tasks.named('compileTestJava') { options.release = 17 }
+tasks.named('test') { useJUnitPlatform() }
+
+def metadataDirectory = layout.buildDirectory.dir('generated/shell-resources')
+tasks.register('shellMetadata') {
+    inputs.property('version', project.version.toString())
+    inputs.property('targets', targets.collect { it.minecraft })
+    inputs.property('minimumLoader', lock.minimumLoader)
+    outputs.dir(metadataDirectory)
+    doLast {
+        def metadata = [
+            schemaVersion: 1, id: 'elytraplus', version: project.version.toString(),
+            name: 'ElytraPlus', environment: '*',
+            entrypoints: [main: ['cn.ericcraft.elytraPlus.fabric.bootstrap.ElytraPlusFabric']],
+            depends: [fabricloader: ">=${lock.minimumLoader}", java: '>=8',
+                      minecraft: targets.collect { '=' + it.minecraft }, elytraplus_runtime: '*'],
+            jars: targets.collect { [file: "META-INF/jars/elytraplus-runtime-${it.minecraft}.jar"] }
+        ]
+        def output = metadataDirectory.get().file('fabric.mod.json').asFile
+        output.parentFile.mkdirs()
+        output.text = JsonOutput.prettyPrint(JsonOutput.toJson(metadata)) + '\n'
+    }
+}
+sourceSets.main.resources.srcDir(metadataDirectory)
+tasks.named('processResources') { dependsOn('shellMetadata') }
+
+// Only locked runtime/driver projects participate in game-specific configuration.
+def gameProjects = targets.collect { target ->
+    def child = project(':mc' + target.minecraft.replace('.', '_'))
+    child.ext.targetSpec = target
+    child.version = rootProject.version.toString() + '-mc.' + target.minecraft
+    child.group = rootProject.group
+    child.apply from: rootProject.file('runtime.gradle')
+    child
+}
+
+tasks.named('shadowJar') {
+    archiveBaseName = 'ElytraPlus-Fabric'
+    archiveClassifier = ''
+    relocate 'org.yaml.snakeyaml', 'cn.ericcraft.elytraPlus.shaded.snakeyaml'
+    exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA', 'META-INF/*.EC', 'META-INF/SIG-*'
+    exclude 'META-INF/versions/**', 'module-info.class'
+    gameProjects.each { child ->
+        def runtimeJar = child.tasks.named(child.targetSpec.namespace == 'intermediary' ? 'remapJar' : 'jar')
+        dependsOn(runtimeJar)
+        into('META-INF/jars') {
+            from(runtimeJar.flatMap { it.archiveFile })
+            rename { "elytraplus-runtime-${child.targetSpec.minecraft}.jar" }
+        }
+    }
+}
+
+apply from: file('verify-native.gradle')
+tasks.register('pythonTests', Exec) {
+    group = 'verification'
+    workingDir(projectDir)
+    commandLine 'python3', '-m', 'unittest', 'discover', '-s', 'tests', '-v'
+}
+tasks.named('check') {
+    dependsOn('pythonTests', 'testHookVerifier', ':shared:check')
+    gameProjects.each { dependsOn(it.tasks.named('verifyNativeHooks')) }
+}
+
+tasks.named('jar') { enabled = false }
+tasks.named('build') { dependsOn('shadowJar') }
+
+// Ship license notices with both self-contained release artifacts.
+tasks.named('processResources') {
+    from(rootProject.file('../LICENSE')) { into 'META-INF' }
+    from(rootProject.file('../THIRD_PARTY_NOTICES.md')) { into 'META-INF' }
+}

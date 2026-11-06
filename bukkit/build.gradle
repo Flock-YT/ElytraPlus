@@ -1,0 +1,100 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '9.2.2'
+}
+
+apply from: file('../gradle/project-version.gradle')
+group = 'cn.ericcraft'
+
+def bukkitJava = providers.gradleProperty('bukkitJava').orElse('21').map { Integer.parseInt(it) }
+def spigotVersion = providers.gradleProperty('spigotVersion').orElse('1.9-R0.1-SNAPSHOT')
+def releaseVersion = project.version.toString()
+java { toolchain { languageVersion = bukkitJava.map { JavaLanguageVersion.of(it) } } }
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 8
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/' }
+}
+dependencies {
+    implementation project(':shared')
+    compileOnly("org.spigotmc:spigot-api:${spigotVersion.get()}") {
+        exclude group: 'net.md-5', module: 'bungeecord-chat'
+    }
+    implementation 'org.bstats:bstats-bukkit:3.2.1'
+    testImplementation("org.spigotmc:spigot-api:${spigotVersion.get()}") {
+        exclude group: 'net.md-5', module: 'bungeecord-chat'
+    }
+    testImplementation 'net.md-5:bungeecord-chat:1.16-R0.4'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testImplementation 'org.mockito:mockito-core:4.11.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
+}
+
+tasks.named('processResources') {
+    inputs.property('version', releaseVersion)
+    filesMatching('plugin.yml') {
+        filter { line -> line.replace('${project.version}', releaseVersion) }
+    }
+}
+tasks.named('test') {
+    useJUnitPlatform()
+    workingDir(rootDir)
+}
+tasks.named('jar') { enabled = false }
+tasks.named('shadowJar') {
+    archiveBaseName = 'ElytraPlus'
+    archiveClassifier = ''
+    manifest { attributes('Multi-Release': 'false') }
+    relocate 'org.bstats', 'cn.ericcraft.elytraPlus.lib.bstats'
+    exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA', 'META-INF/*.EC', 'META-INF/SIG-*'
+}
+tasks.named('assemble') { dependsOn('shadowJar') }
+
+tasks.register('verifyReleaseJar', Exec) {
+    group = 'verification'
+    dependsOn('shadowJar')
+    inputs.file(tasks.named('shadowJar').flatMap { it.archiveFile })
+    inputs.files(rootProject.files('scripts/verify-release-jar.sh', 'scripts/project_version.py', 'scripts/shared_artifact.py', 'gradle.properties'))
+    workingDir(rootDir)
+    commandLine 'bash', 'scripts/verify-release-jar.sh',
+            tasks.named('shadowJar').get().archiveFile.get().asFile.absolutePath, releaseVersion
+    def launcher = javaToolchains.launcherFor { languageVersion = bukkitJava.map { JavaLanguageVersion.of(it) } }
+    doFirst {
+        String javaHome = launcher.get().metadata.installationPath.asFile.absolutePath
+        environment 'JAVA_HOME', javaHome
+        environment 'PATH', javaHome + '/bin' + File.pathSeparator + System.getenv('PATH')
+    }
+}
+tasks.named('check') { dependsOn('verifyReleaseJar') }
+tasks.named('build') { dependsOn(':shared:check', ':pythonTests') }
+tasks.named('clean') { dependsOn(':shared:clean') }
+
+// Resolve each smoke-test API without recompiling or replacing the release JAR.
+def compatibilityApi = providers.gradleProperty('compatibilityApi').orElse('1.9')
+configurations { compatibilityRuntime }
+dependencies {
+    compatibilityRuntime("org.spigotmc:spigot-api:${compatibilityApi.get()}-R0.1-SNAPSHOT") {
+        exclude group: 'net.md-5', module: 'bungeecord-chat'
+    }
+    compatibilityRuntime 'net.md-5:bungeecord-chat:1.16-R0.4'
+    compatibilityRuntime 'org.mockito:mockito-core:4.11.0'
+}
+tasks.register('writeCompatibilityClasspath') {
+    def output = rootProject.layout.buildDirectory.file("compatibility/${compatibilityApi.get()}.classpath")
+    outputs.file(output)
+    inputs.files(configurations.compatibilityRuntime)
+    doLast {
+        output.get().asFile.parentFile.mkdirs()
+        output.get().asFile.text = configurations.compatibilityRuntime.asPath
+    }
+}
+
+// Ship license notices with both self-contained release artifacts.
+tasks.named('processResources') {
+    from(rootProject.file('LICENSE')) { into 'META-INF' }
+    from(rootProject.file('THIRD_PARTY_NOTICES.md')) { into 'META-INF' }
+}

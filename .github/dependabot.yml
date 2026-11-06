@@ -5,7 +5,12 @@ updates:
     schedule:
       interval: weekly
 
-  - package-ecosystem: maven
+  - package-ecosystem: gradle
     directory: "/"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gradle
+    directory: "/fabric"
     schedule:
       interval: weekly
